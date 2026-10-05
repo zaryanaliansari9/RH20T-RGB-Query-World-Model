@@ -1,67 +1,98 @@
 # RH20T RGB Query Token World Model
 
-A multimodal world model for robotic manipulation trained on the RH20T dataset.
+An action-conditioned visual world model for robotic manipulation based on the
+[RH20T](https://rh20t.github.io/) dataset.
 
-The model predicts future RGB observations from a history of RGB observations, robot TCP state, and future actions. The architecture combines spatial visual tokens with learned RGB query tokens for autoregressive multi-step prediction.
+The model predicts future RGB observations from:
 
-## Model
+- a history of RGB observations,
+- robot TCP state,
+- and a sequence of future actions.
 
-- Dataset: RH20T
-- History length: 16 frames
-- Prediction horizon: 10 steps
-- RGB resolution: 128 × 128
-- Spatial visual grid: 4 × 4
-- Visual tokens per frame: 16
-- Learned RGB query tokens: 16
-- Transformer embedding dimension: 256
-- Transformer heads: 4
-- Transformer layers: 2
-- Output: future RGB observations
+The architecture combines spatial visual tokens, temporal Transformer attention,
+and learned RGB query tokens for multi-step visual prediction.
 
-### RGB Query Tokens
+---
 
-The model introduces 16 learned RGB query tokens corresponding to the 4 × 4 output latent structure.
+## Overview
 
-The query tokens attend to the spatiotemporal observation history and the action token. Their resulting representations are transformed into the future RGB latent representation and decoded into the predicted image.
+The model uses a 16-frame observation history and predicts the next 10 RGB
+observations autoregressively.
 
-The learned query tokens are not fixed image patches. They are trainable queries that aggregate information required to construct the future visual observation.
+### Key components
 
-## Results
+1. **Spatial visual encoding**
+   - Each RGB frame is encoded into a `4 × 4` spatial token grid.
+   - This produces 16 visual tokens per frame.
 
-Evaluation was performed on 47,023 unseen test samples.
+2. **Robot-state encoding**
+   - The robot TCP state is represented as a separate token for each history frame.
 
-| Metric | Result |
+3. **Action conditioning**
+   - Future actions are represented using a dedicated action token.
+
+4. **Transformer dynamics**
+   - Spatial and temporal information from the observation history is processed
+     jointly using a Transformer encoder.
+
+5. **Learned RGB query tokens**
+   - 16 trainable query tokens are appended to the Transformer input.
+   - These queries aggregate information from the observation history and action.
+   - Their output representations are converted into a `4 × 4` future RGB latent
+     representation and decoded into the predicted image.
+
+The RGB query tokens are **not fixed image patches**. They are learned query
+representations used to extract the information required for constructing the
+future RGB observation.
+
+---
+
+# Model Configuration
+
+| Parameter | Value |
 |---|---:|
-| RGB MSE | 0.005411 |
-| RGB MAE | 0.031076 |
-| SSIM | 0.846749 |
-| PSNR | 22.6673 dB |
-| t+1 MSE | 0.004916 |
-| t+10 MSE | 0.006139 |
+| Dataset | RH20T |
+| History length | 16 frames |
+| Prediction horizon | 10 steps |
+| RGB resolution | 128 × 128 |
+| Spatial grid | 4 × 4 |
+| Visual tokens / frame | 16 |
+| Learned RGB query tokens | 16 |
+| Transformer dimension | 256 |
+| Attention heads | 4 |
+| Transformer layers | 2 |
+| Output | Future RGB observations |
 
-## Repository Structure
+---
+
+# Repository Structure
 
 ```text
 RH20T-RGB-Query-World-Model/
-├── README.md
-├── requirements.txt
-├── .gitignore
-├── .gitattributes
-├── LICENSE
-├── src/
-│   └── rgb_query_world_model.py
+│
+├── checkpoints/
+│   └── best.pt
+│
+├── results/
+│   ├── metrics.json
+│   ├── training_history.json
+│   ├── rgb_prediction_00.png
+│   ├── rgb_prediction_01.png
+│   ├── rgb_prediction_02.png
+│   ├── rgb_prediction_03.png
+│   ├── rgb_prediction_04.png
+│   ├── rgb_error_per_step.png
+│   └── ssim_per_step.png
+│
 ├── scripts/
 │   ├── train.py
 │   └── evaluate.py
-├── checkpoints/
-│   └── best.pt
-└── results/
-    ├── training_history.json
-    ├── metrics.json
-    ├── rgb_prediction_00.png
-    ├── rgb_prediction_01.png
-    ├── rgb_prediction_02.png
-    ├── rgb_prediction_03.png
-    ├── rgb_prediction_04.png
-    ├── rgb_error_per_step.png
-    └── ssim_per_step.png
+│
+├── src/
+│   └── rgb_query_world_model.py
+│
+├── .gitattributes
+├── .gitignore
+├── LICENSE
+├── README.md
+└── requirements.txt
