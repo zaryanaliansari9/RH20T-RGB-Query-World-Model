@@ -1,49 +1,46 @@
 # RH20T RGB Query Token World Model
 
 An action-conditioned visual world model for robotic manipulation based on the
-[RH20T](https://rh20t.github.io/) dataset.
+RH20T dataset.
 
 The model predicts future RGB observations from:
 
 - a history of RGB observations,
 - robot TCP state,
-- and a sequence of future actions.
+- and future actions.
 
-The architecture combines spatial visual tokens, temporal Transformer attention,
-and learned RGB query tokens for multi-step visual prediction.
+The architecture combines spatial visual tokens, Transformer-based temporal
+dynamics, and learned RGB query tokens for autoregressive multi-step visual
+prediction.
 
 ---
 
 ## Overview
 
-The model uses a 16-frame observation history and predicts the next 10 RGB
+The model receives a 16-frame observation history and predicts the next 10 RGB
 observations autoregressively.
 
-### Key components
+### Architecture
 
-1. **Spatial visual encoding**
-   - Each RGB frame is encoded into a `4 × 4` spatial token grid.
-   - This produces 16 visual tokens per frame.
+Each RGB observation is encoded into a spatial `4 × 4` grid of visual tokens.
 
-2. **Robot-state encoding**
-   - The robot TCP state is represented as a separate token for each history frame.
+For each historical timestep, the model uses:
 
-3. **Action conditioning**
-   - Future actions are represented using a dedicated action token.
+- 16 spatial visual tokens
+- 1 TCP-state token
 
-4. **Transformer dynamics**
-   - Spatial and temporal information from the observation history is processed
-     jointly using a Transformer encoder.
+The future action sequence is represented using an action token.
 
-5. **Learned RGB query tokens**
-   - 16 trainable query tokens are appended to the Transformer input.
-   - These queries aggregate information from the observation history and action.
-   - Their output representations are converted into a `4 × 4` future RGB latent
-     representation and decoded into the predicted image.
+The Transformer processes the complete spatiotemporal history together with the
+future action information. In addition, 16 learned RGB query tokens are appended
+to the Transformer input.
 
-The RGB query tokens are **not fixed image patches**. They are learned query
-representations used to extract the information required for constructing the
-future RGB observation.
+The final query representations are mapped to a `4 × 4` RGB latent
+representation and decoded into the predicted RGB observation.
+
+The learned RGB query tokens are not fixed image patches. They are trainable
+query representations that aggregate information required to construct the
+future visual observation.
 
 ---
 
@@ -56,12 +53,19 @@ future RGB observation.
 | Prediction horizon | 10 steps |
 | RGB resolution | 128 × 128 |
 | Spatial grid | 4 × 4 |
-| Visual tokens / frame | 16 |
+| Visual tokens per frame | 16 |
 | Learned RGB query tokens | 16 |
 | Transformer dimension | 256 |
 | Attention heads | 4 |
 | Transformer layers | 2 |
-| Output | Future RGB observations |
+| Feed-forward dimension | 512 |
+| Dropout | 0.1 |
+| Action dimension | 6 |
+| TCP dimension | 7 |
+| Batch size | 16 |
+| Learning rate | 1e-4 |
+| Training epochs | 2 |
+| Random seed | 42 |
 
 ---
 
@@ -69,6 +73,14 @@ future RGB observation.
 
 ```text
 RH20T-RGB-Query-World-Model/
+│
+├── src/
+│   └── rgb_query_world_model.py
+│
+├── scripts/
+│   ├── prepare_dataset.py
+│   ├── train.py
+│   └── evaluate.py
 │
 ├── checkpoints/
 │   └── best.pt
@@ -84,15 +96,8 @@ RH20T-RGB-Query-World-Model/
 │   ├── rgb_error_per_step.png
 │   └── ssim_per_step.png
 │
-├── scripts/
-│   ├── train.py
-│   └── evaluate.py
-│
-├── src/
-│   └── rgb_query_world_model.py
-│
-├── .gitattributes
-├── .gitignore
-├── LICENSE
 ├── README.md
-└── requirements.txt
+├── requirements.txt
+├── LICENSE
+├── .gitignore
+└── .gitattributes
