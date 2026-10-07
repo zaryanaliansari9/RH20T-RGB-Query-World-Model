@@ -1,45 +1,41 @@
+#!/usr/bin/env python3
+"""
+33_evaluate_multistep_rgb_queries.py
+
+Evaluation script for the RH20T RGB Query Token world model trained by
+32_train_multistep_spatial_transformer.py.
+
+The model is evaluated with the same 16-frame history, 10-step horizon,
+128x128 RGB inputs, normalized TCP/action inputs, and autoregressive RGB
+feedback used during training.
+
+Example:
+    python scripts/33_evaluate_multistep_rgb_queries.py \
+        --data-root /path/to/prepared/RH20T \
+        --checkpoint checkpoints/best.pt \
+        --output-dir results/evaluation
+"""
+
+import argparse
 import json
+import math
 import random
-import time
 from pathlib import Path
 
+import matplotlib.pyplot as plt
 import numpy as np
 import torch
 import torch.nn as nn
-import matplotlib.pyplot as plt
-
 from pytorch_msssim import ssim
-
 from torch.utils.data import Dataset, DataLoader
 
 
 # ============================================================
-# CONFIG
+# MODEL / DATA SETTINGS — MATCH TRAINING SCRIPT EXACTLY
 # ============================================================
-
-ROOT = Path("dataset")
-
-INDEX_PATH = ROOT / "multistep_index" / "samples.npy"
-TRAIN_DIR = ROOT / "multistep_training"
-
-CACHE_DIR = ROOT / "preprocessed_images"
-CACHE_FILE = CACHE_DIR / "images.dat"
-CACHE_INDEX_FILE = CACHE_DIR / "index.json"
-
-MODEL_DIR = ROOT / "world_model_spatial_transformer"
-CHECKPOINT = MODEL_DIR / "best.pt"
-
-OUTPUT_DIR = MODEL_DIR / "evaluation"
-OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-
-
-# ------------------------------------------------------------
-# Dataset settings
-# ------------------------------------------------------------
 
 HISTORY = 16
 HORIZON = 10
-
 IMAGE_SIZE = 128
 
 TRANSFORMER_DIM = 256
@@ -51,305 +47,55 @@ TRANSFORMER_DROPOUT = 0.1
 SPATIAL_GRID = 4
 NUM_VISUAL_TOKENS = SPATIAL_GRID * SPATIAL_GRID
 
-
-# ------------------------------------------------------------
-# Evaluation settings
-# ------------------------------------------------------------
-
-# Number of test samples to evaluate.
-#
-# Start with 100.
-#
-# Increase later to 500 or the complete test set.
-NUM_EVAL_SAMPLES = None
-
-BATCH_SIZE = 16
-
-NUM_WORKERS = 2
-
 SEED = 42
-
-
-# ------------------------------------------------------------
-# Device
-# ------------------------------------------------------------
-
-DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
 
 # ============================================================
 # REPRODUCIBILITY
 # ============================================================
 
-random.seed(SEED)
-np.random.seed(SEED)
-torch.manual_seed(SEED)
+def set_seed(seed: int) -> None:
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+        torch.backends.cudnn.benchmark = True
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
 
-if torch.cuda.is_available():
-    torch.cuda.manual_seed_all(SEED)
-
-    torch.backends.cudnn.benchmark = True
-    torch.backends.cuda.matmul.allow_tf32 = True
-    torch.backends.cudnn.allow_tf32 = True
-
-
-# ============================================================
-# HEADER
-# ============================================================
-
-print("=" * 70)
-print(
-    "MULTISTEP WORLD MODEL EVALUATION "
-    "(RGB ONLY + L1 SSIM)"
-)
-print("=" * 70)
-
-print("Device     :", DEVICE)
-
-if DEVICE == "cuda":
-    print(
-        "GPU        :",
-        torch.cuda.get_device_name(0),
-    )
-
-print("Checkpoint :", CHECKPOINT)
-print("Output     :", OUTPUT_DIR)
-
-print("Dynamics        : Spatial Transformer")
-print("Dim             :", TRANSFORMER_DIM)
-print("Heads           :", TRANSFORMER_HEADS)
-print("Layers          :", TRANSFORMER_LAYERS)
-print("Spatial grid    :", SPATIAL_GRID, "x", SPATIAL_GRID)
 
 # ============================================================
-# CHECK FILES
+# IMAGE CACHE
 # ============================================================
 
-required_files = [
-    INDEX_PATH,
-    TRAIN_DIR / "test_indices.npy",
-    TRAIN_DIR / "action_mean.npy",
-    TRAIN_DIR / "action_std.npy",
-    TRAIN_DIR / "tcp_mean.npy",
-    TRAIN_DIR / "tcp_std.npy",
-    CACHE_FILE,
-    CACHE_INDEX_FILE,
-    CHECKPOINT,
-]
+class ImageCache:
+    def __init__(self, image_file: Path, index_file: Path):
+        with index_file.open("r") as f:
+            index = json.load(f)
 
-for file in required_files:
-
-    if not file.exists():
-
-        raise FileNotFoundError(
-            f"\nRequired file not found:\n{file}"
+        self.paths = index["paths"]
+        self.num_images = int(index["num_images"])
+        self.images = np.memmap(
+            image_file,
+            dtype=np.uint8,
+            mode="r",
+            shape=(self.num_images, 3, IMAGE_SIZE, IMAGE_SIZE),
         )
 
-
-# ============================================================
-# LOAD SAMPLE INDEX
-# ============================================================
-
-print("\nLoading sample index...")
-
-samples = np.load(
-    INDEX_PATH,
-    allow_pickle=True,
-)
-
-print(
-    "Total samples:",
-    len(samples),
-)
-
-
-# ============================================================
-# LOAD TEST INDICES
-# ============================================================
-
-print("\nLoading test indices")
-
-eval_indices_all = np.load(
-    TRAIN_DIR / "test_indices.npy"
-)
-
-print(
-    "Total test samples:",
-    len(eval_indices_all),
-)
-
-
-# ============================================================
-# SELECT EVALUATION SAMPLES
-# ============================================================
-
-rng = np.random.default_rng(SEED)
-
-if NUM_EVAL_SAMPLES is None:
-    eval_indices = eval_indices_all
-elif len(eval_indices_all) > NUM_EVAL_SAMPLES:
-    eval_indices = rng.choice(
-        eval_indices_all,
-        size=NUM_EVAL_SAMPLES,
-        replace=False,
-    )
-else:
-    eval_indices = eval_indices_all
-
-eval_indices = np.asarray(
-    eval_indices,
-    dtype=np.int64,
-)
-
-print(
-    "Evaluation samples:",
-    len(eval_indices),
-)
-
-
-# ============================================================
-# LOAD NORMALIZATION
-# ============================================================
-
-action_mean = torch.tensor(
-    np.load(
-        TRAIN_DIR / "action_mean.npy"
-    ),
-    dtype=torch.float32,
-)
-
-action_std = torch.tensor(
-    np.load(
-        TRAIN_DIR / "action_std.npy"
-    ),
-    dtype=torch.float32,
-)
-
-tcp_mean = torch.tensor(
-    np.load(
-        TRAIN_DIR / "tcp_mean.npy"
-    ),
-    dtype=torch.float32,
-)
-
-tcp_std = torch.tensor(
-    np.load(
-        TRAIN_DIR / "tcp_std.npy"
-    ),
-    dtype=torch.float32,
-)
-
-
-print("\nNormalization loaded.")
-
-
-# ============================================================
-# LOAD IMAGE CACHE
-# ============================================================
-
-print("\nLoading preprocessed image cache...")
-
-with open(
-    CACHE_INDEX_FILE,
-    "r",
-) as f:
-
-    cache_index = json.load(f)
-
-
-NUM_IMAGES = cache_index["num_images"]
-
-CACHE_SHAPE = (
-    NUM_IMAGES,
-    3,
-    IMAGE_SIZE,
-    IMAGE_SIZE,
-)
-
-images = np.memmap(
-    CACHE_FILE,
-    dtype=np.uint8,
-    mode="r",
-    shape=CACHE_SHAPE,
-)
-
-print(
-    "Cached images:",
-    NUM_IMAGES,
-)
-
-print(
-    "Cache shape  :",
-    images.shape,
-)
-
-
-# ============================================================
-# PATH -> CACHE ID
-# ============================================================
-
-print("\nLoading image path index...")
-
-path_to_id = cache_index["paths"]
-
-print(
-    "Indexed paths:",
-    len(path_to_id),
-)
-
-
-# ============================================================
-# CACHE IMAGE LOADER
-# ============================================================
-
-def load_cached_image(path):
-    """
-    Load one image from the preprocessed memmap.
-
-    Returns:
-
-        (3, 128, 128)
-
-        float32
-
-        [0, 1]
-    """
-
-    path = str(path)
-
-    if path not in path_to_id:
-
-        raise KeyError(
-            f"\nImage path not found in cache:\n{path}"
-        )
-
-    image_id = path_to_id[path]
-
-    arr = images[image_id]
-
-    # Copy before converting to torch.
-    #
-    # This prevents problems with the read-only memmap.
-
-    arr = np.array(
-        arr,
-        dtype=np.uint8,
-        copy=True,
-    )
-
-    return (
-        torch.from_numpy(arr)
-        .float()
-        .div_(255.0)
-    )
+    def load(self, path: str) -> torch.Tensor:
+        image_id = self.paths.get(str(path))
+        if image_id is None:
+            raise KeyError(f"Image path not found in cache:\n{path}")
+        arr = np.array(self.images[image_id], dtype=np.uint8, copy=True)
+        return torch.from_numpy(arr)
 
 
 # ============================================================
 # DATASET
 # ============================================================
 
-class EvaluationDataset(Dataset):
-
+class MultistepDataset(Dataset):
     def __init__(
         self,
         samples,
@@ -358,105 +104,38 @@ class EvaluationDataset(Dataset):
         action_std,
         tcp_mean,
         tcp_std,
+        image_cache: ImageCache,
     ):
-
         self.samples = samples
         self.indices = indices
-
         self.action_mean = action_mean
         self.action_std = action_std
-
         self.tcp_mean = tcp_mean
         self.tcp_std = tcp_std
-
+        self.image_cache = image_cache
 
     def __len__(self):
-
         return len(self.indices)
 
-
     def __getitem__(self, i):
-
-        idx = int(
-            self.indices[i]
-        )
-
-        sample = self.samples[idx]
-
-
-        # ----------------------------------------------------
-        # RGB HISTORY
-        # ----------------------------------------------------
-
-        rgb_paths = sample[
-            "rgb_history"
-        ]
+        sample = self.samples[int(self.indices[i])]
 
         rgb_history = torch.stack(
-            [
-                load_cached_image(p)
-                for p in rgb_paths
-            ]
+            [self.image_cache.load(p) for p in sample["rgb_history"]]
         )
-
-        # (16, 3, 128, 128)
-
-
-        # ----------------------------------------------------
-        # TARGET RGB
-        # ----------------------------------------------------
-
-        target_paths = sample[
-            "target_rgb"
-        ]
-
         target_rgb = torch.stack(
-            [
-                load_cached_image(p)
-                for p in target_paths
-            ]
+            [self.image_cache.load(p) for p in sample["target_rgb"]]
         )
-
-        # (10, 3, 128, 128)
-
-
-        # ----------------------------------------------------
-        # TCP
-        # ----------------------------------------------------
 
         tcp_history = torch.tensor(
-            sample["tcp_history"],
-            dtype=torch.float32,
+            sample["tcp_history"], dtype=torch.float32
         )
-
-        # ----------------------------------------------------
-        # ACTIONS
-        # ----------------------------------------------------
-
         actions = torch.tensor(
-            sample["actions"],
-            dtype=torch.float32,
+            sample["actions"], dtype=torch.float32
         )
 
-
-        # ----------------------------------------------------
-        # NORMALIZATION
-        # ----------------------------------------------------
-
-        tcp_history = (
-            tcp_history
-            - self.tcp_mean
-        ) / (
-            self.tcp_std + 1e-8
-        )
-
-        actions = (
-            actions
-            - self.action_mean
-        ) / (
-            self.action_std + 1e-8
-        )
-
+        tcp_history = (tcp_history - self.tcp_mean) / (self.tcp_std + 1e-8)
+        actions = (actions - self.action_mean) / (self.action_std + 1e-8)
 
         return {
             "rgb_history": rgb_history,
@@ -467,146 +146,50 @@ class EvaluationDataset(Dataset):
 
 
 # ============================================================
-# MODEL
+# MODEL — EXACT STATE-DICT COMPATIBLE ARCHITECTURE
 # ============================================================
 
 class ImageEncoder(nn.Module):
-
-    def __init__(
-        self,
-        feature_dim=256,
-    ):
-
+    def __init__(self, feature_dim=256):
         super().__init__()
-
         self.net = nn.Sequential(
-
-            nn.Conv2d(
-                3,
-                32,
-                4,
-                stride=2,
-                padding=1,
-            ),
+            nn.Conv2d(3, 32, 4, stride=2, padding=1),
             nn.ReLU(),
-
-            nn.Conv2d(
-                32,
-                64,
-                4,
-                stride=2,
-                padding=1,
-            ),
+            nn.Conv2d(32, 64, 4, stride=2, padding=1),
             nn.ReLU(),
-
-            nn.Conv2d(
-                64,
-                128,
-                4,
-                stride=2,
-                padding=1,
-            ),
+            nn.Conv2d(64, 128, 4, stride=2, padding=1),
             nn.ReLU(),
-
-            nn.Conv2d(
-                128,
-                feature_dim,
-                4,
-                stride=2,
-                padding=1,
-            ),
+            nn.Conv2d(128, feature_dim, 4, stride=2, padding=1),
             nn.ReLU(),
-
-            nn.AdaptiveAvgPool2d(
-                (
-                    SPATIAL_GRID,
-                    SPATIAL_GRID,
-                )
-            ),
+            nn.AdaptiveAvgPool2d((SPATIAL_GRID, SPATIAL_GRID)),
         )
 
     def forward(self, x):
-
         return self.net(x)
 
 
-# ============================================================
-# IMAGE DECODER
-# ============================================================
-
 class ImageDecoder(nn.Module):
-
-    def __init__(
-        self,
-        latent_dim=128,
-    ):
-
+    def __init__(self, latent_dim=128):
         super().__init__()
-
         self.net = nn.Sequential(
-
-            # 4 -> 8
-            nn.ConvTranspose2d(
-                latent_dim,
-                128,
-                kernel_size=4,
-                stride=2,
-                padding=1,
-            ),
+            nn.ConvTranspose2d(latent_dim, 256, 4, stride=2, padding=1),
             nn.ReLU(),
-
-            # 8 -> 16
-            nn.ConvTranspose2d(
-                128,
-                64,
-                kernel_size=4,
-                stride=2,
-                padding=1,
-            ),
+            nn.ConvTranspose2d(256, 128, 4, stride=2, padding=1),
             nn.ReLU(),
-
-            # 16 -> 32
-            nn.ConvTranspose2d(
-                64,
-                32,
-                kernel_size=4,
-                stride=2,
-                padding=1,
-            ),
+            nn.ConvTranspose2d(128, 64, 4, stride=2, padding=1),
             nn.ReLU(),
-
-            # 32 -> 64
-            nn.ConvTranspose2d(
-                32,
-                16,
-                kernel_size=4,
-                stride=2,
-                padding=1,
-            ),
+            nn.ConvTranspose2d(64, 32, 4, stride=2, padding=1),
             nn.ReLU(),
-
-            # 64 -> 128
-            nn.ConvTranspose2d(
-                16,
-                3,
-                kernel_size=4,
-                stride=2,
-                padding=1,
-            ),
+            nn.ConvTranspose2d(32, 16, 4, stride=2, padding=1),
+            nn.ReLU(),
+            nn.Conv2d(16, 3, 3, padding=1),
         )
 
     def forward(self, z):
+        return torch.sigmoid(self.net(z))
 
-        return torch.sigmoid(
-            self.net(z)
-        )
-
-# ============================================================
-# WORLD MODEL — TRANSFORMER DYNAMICS
-# ============================================================
 
 class WorldModel(nn.Module):
-
     def __init__(
         self,
         image_latent=128,
@@ -617,102 +200,40 @@ class WorldModel(nn.Module):
         dim_feedforward=TRANSFORMER_FF_DIM,
         dropout=TRANSFORMER_DROPOUT,
     ):
-
         super().__init__()
 
         self.image_latent = image_latent
         self.feature_dim = feature_dim
         self.d_model = d_model
 
-        # ====================================================
-        # IMAGE ENCODER
-        # ====================================================
-
-        self.image_encoder = ImageEncoder(
-            feature_dim=feature_dim
-        )
-
-        # ====================================================
-        # VISUAL TOKEN PROJECTION
-        # ====================================================
-
-        self.visual_projection = nn.Linear(
-            feature_dim,
-            d_model,
-        )
-
-        # ====================================================
-        # TCP ENCODER
-        # ====================================================
+        self.image_encoder = ImageEncoder(feature_dim=feature_dim)
+        self.visual_projection = nn.Linear(feature_dim, d_model)
 
         self.tcp_encoder = nn.Sequential(
-            nn.Linear(
-                7,
-                64,
-            ),
+            nn.Linear(7, 64),
             nn.ReLU(),
         )
-
-        self.tcp_projection = nn.Linear(
-            64,
-            d_model,
-        )
-
-        # ====================================================
-        # ACTION ENCODER
-        # ====================================================
+        self.tcp_projection = nn.Linear(64, d_model)
 
         self.action_encoder = nn.Sequential(
-            nn.Linear(
-                6,
-                64,
-            ),
+            nn.Linear(6, 64),
             nn.ReLU(),
         )
-
-        self.action_projection = nn.Linear(
-            64,
-            d_model,
-        )
-
-        # ====================================================
-        # POSITIONAL EMBEDDINGS
-        # ====================================================
+        self.action_projection = nn.Linear(64, d_model)
 
         self.temporal_position = nn.Parameter(
-            torch.zeros(
-                1,
-                HISTORY,
-                1,
-                d_model,
-            )
+            torch.zeros(1, HISTORY, 1, d_model)
         )
-
         self.spatial_position = nn.Parameter(
-            torch.zeros(
-                1,
-                1,
-                NUM_VISUAL_TOKENS,
-                d_model,
-            )
+            torch.zeros(1, 1, NUM_VISUAL_TOKENS, d_model)
         )
 
-        # ====================================================
-        # TOKEN TYPES
-        #
-        # 0 = visual
-        # 1 = TCP
-        # 2 = action
-        # ====================================================
+        self.token_type_embedding = nn.Embedding(4, d_model)
 
-        self.token_type_embedding = nn.Embedding(
-            3,
-            d_model,
+        self.rgb_query_tokens = nn.Parameter(
+            torch.zeros(1, NUM_VISUAL_TOKENS, d_model)
         )
-
-        # ====================================================
-        # TRANSFORMER
-        # ====================================================
+        nn.init.normal_(self.rgb_query_tokens, mean=0.0, std=0.02)
 
         encoder_layer = nn.TransformerEncoderLayer(
             d_model=d_model,
@@ -723,310 +244,95 @@ class WorldModel(nn.Module):
             batch_first=True,
             norm_first=False,
         )
-
         self.history_transformer = nn.TransformerEncoder(
             encoder_layer,
             num_layers=num_layers,
         )
-
-        self.transformer_norm = nn.LayerNorm(
-            d_model
-        )
-
-        # ====================================================
-        # RGB LATENT HEAD
-        # ====================================================
+        self.transformer_norm = nn.LayerNorm(d_model)
 
         self.rgb_latent_head = nn.Sequential(
-
-            nn.Linear(
-                d_model,
-                image_latent,
-            ),
-
+            nn.Linear(d_model, image_latent),
             nn.ReLU(),
         )
 
-        # ====================================================
-        # TCP HEAD
-        # ====================================================
+        self.decoder = ImageDecoder(latent_dim=image_latent)
 
-        self.tcp_head = nn.Sequential(
+        nn.init.normal_(self.temporal_position, mean=0.0, std=0.02)
+        nn.init.normal_(self.spatial_position, mean=0.0, std=0.02)
 
-            nn.Linear(
-                d_model,
-                d_model,
-            ),
-
-            nn.ReLU(),
-
-            nn.Linear(
-                d_model,
-                7,
-            ),
-        )
-
-        # ====================================================
-        # IMAGE DECODER
-        # ====================================================
-
-        self.decoder = ImageDecoder(
-            latent_dim=image_latent
-        )
-
-    # ========================================================
-    # ENCODE HISTORY
-    # ========================================================
-
-    def encode_history(
-        self,
-        rgb_history,
-        tcp_history,
-    ):
-
+    def encode_history(self, rgb_history, tcp_history):
         B, T, C, H, W = rgb_history.shape
 
-        # ----------------------------------------------------
-        # RGB -> SPATIAL FEATURES
-        # ----------------------------------------------------
-
-        rgb = rgb_history.reshape(
-            B * T,
-            C,
-            H,
-            W,
+        rgb = rgb_history.reshape(B * T, C, H, W)
+        visual_features = self.image_encoder(rgb)
+        visual_features = visual_features.flatten(2).transpose(1, 2)
+        visual_features = visual_features.reshape(
+            B, T, NUM_VISUAL_TOKENS, self.feature_dim
         )
 
-        visual_features = self.image_encoder(
-            rgb
-        )
-
-        # [B*T, 256, 4, 4]
-
-        # ----------------------------------------------------
-        # SPATIAL FEATURE MAP -> TOKENS
-        # ----------------------------------------------------
-
-        visual_features = (
-            visual_features
-            .flatten(2)
-            .transpose(1, 2)
-        )
-
-        # [B*T, 16, 256]
-
-        visual_features = (
-            visual_features
-            .reshape(
-                B,
-                T,
-                NUM_VISUAL_TOKENS,
-                self.feature_dim,
-            )
-        )
-
-        # ----------------------------------------------------
-        # PROJECT VISUAL TOKENS
-        # ----------------------------------------------------
-
-        visual_tokens = self.visual_projection(
-            visual_features
-        )
-
-        # [B, 16, 16, 256]
-
-        # ----------------------------------------------------
-        # TEMPORAL + SPATIAL POSITION
-        # ----------------------------------------------------
-
+        visual_tokens = self.visual_projection(visual_features)
         visual_tokens = (
             visual_tokens
             + self.temporal_position[:, :T]
-            + self.spatial_position[
-                :,
-                :,
-                :NUM_VISUAL_TOKENS
-            ]
+            + self.spatial_position[:, :, :NUM_VISUAL_TOKENS]
         )
-
-        # ----------------------------------------------------
-        # VISUAL TOKEN TYPE
-        # ----------------------------------------------------
 
         visual_type = self.token_type_embedding(
-            torch.tensor(
-                0,
-                device=rgb_history.device,
-            )
+            torch.tensor(0, device=rgb_history.device)
         )
+        visual_tokens = visual_tokens + visual_type
 
-        visual_tokens = (
-            visual_tokens
-            + visual_type
-        )
-
-        # ====================================================
-        # TCP TOKENS
-        # ====================================================
-
-        tcp_z = self.tcp_encoder(
-            tcp_history
-        )
-
-        tcp_tokens = self.tcp_projection(
-            tcp_z
-        )
-
-        # [B, 16, 256]
-
-        tcp_tokens = (
-            tcp_tokens
-            + self.temporal_position[
-                :,
-                :T,
-                0,
-                :
-            ]
-        )
+        tcp_z = self.tcp_encoder(tcp_history)
+        tcp_tokens = self.tcp_projection(tcp_z)
+        tcp_tokens = tcp_tokens + self.temporal_position[:, :T, 0, :]
 
         tcp_type = self.token_type_embedding(
-            torch.tensor(
-                1,
-                device=rgb_history.device,
-            )
+            torch.tensor(1, device=rgb_history.device)
         )
-
-        tcp_tokens = (
-            tcp_tokens
-            + tcp_type
-        )
-
-        # ====================================================
-        # INTERLEAVE VISUAL + TCP
-        # ====================================================
+        tcp_tokens = tcp_tokens + tcp_type
 
         frame_tokens = torch.cat(
-            [
-                visual_tokens,
-                tcp_tokens.unsqueeze(2),
-            ],
-            dim=2,
+            [visual_tokens, tcp_tokens.unsqueeze(2)], dim=2
         )
-
-        # [B, 16, 17, 256]
-
-        frame_tokens = frame_tokens.reshape(
+        return frame_tokens.reshape(
             B,
             T * (NUM_VISUAL_TOKENS + 1),
             self.d_model,
         )
 
-        # [B, 272, 256]
-
-        return frame_tokens
-
-    # ========================================================
-    # ONE-STEP SPATIAL TRANSFORMER PREDICTION
-    # ========================================================
-
-    def predict_one_step(
-        self,
-        rgb_history,
-        tcp_history,
-        action,
-    ):
-
+    def predict_one_step(self, rgb_history, tcp_history, action):
         B = rgb_history.shape[0]
 
-        # --------------------------------------------------------
-        # HISTORY TOKENS
-        # --------------------------------------------------------
-
         history_tokens = self.encode_history(
-            rgb_history,
-            tcp_history,
+            rgb_history, tcp_history
         )
 
-        # --------------------------------------------------------
-        # ACTION TOKEN
-        # --------------------------------------------------------
-
-        action_z = self.action_encoder(
-            action
-        )
-
-        action_token = self.action_projection(
-            action_z
-        ).unsqueeze(1)
-
+        action_z = self.action_encoder(action)
+        action_token = self.action_projection(action_z).unsqueeze(1)
         action_type = self.token_type_embedding(
-            torch.tensor(
-                2,
-                device=rgb_history.device,
-            )
+            torch.tensor(2, device=rgb_history.device)
         )
+        action_token = action_token + action_type
 
-        action_token = (
-            action_token
-            + action_type
+        query_type = self.token_type_embedding(
+            torch.tensor(3, device=rgb_history.device)
         )
-
-        # --------------------------------------------------------
-        # HISTORY + ACTION
-        # --------------------------------------------------------
+        query_tokens = (
+            self.rgb_query_tokens
+            + self.spatial_position.squeeze(1)[:, :NUM_VISUAL_TOKENS, :]
+            + query_type
+        )
+        query_tokens = query_tokens.expand(B, -1, -1)
 
         tokens = torch.cat(
-            [
-                history_tokens,
-                action_token,
-            ],
-            dim=1,
+            [history_tokens, action_token, query_tokens], dim=1
         )
 
-        # --------------------------------------------------------
-        # TRANSFORMER
-        # --------------------------------------------------------
+        transformed = self.history_transformer(tokens)
+        transformed = self.transformer_norm(transformed)
 
-        transformed = self.history_transformer(
-            tokens
-        )
-
-        transformed = self.transformer_norm(
-            transformed
-        )
-
-        # --------------------------------------------------------
-        # CURRENT FRAME VISUAL TOKENS
-        # --------------------------------------------------------
-
-        history_transformed = (
-            transformed[:, :-1]
-            .reshape(
-                B,
-                HISTORY,
-                NUM_VISUAL_TOKENS + 1,
-                self.d_model,
-            )
-        )
-
-        current_visual_tokens = (
-            history_transformed[
-                :,
-                -1,
-                :NUM_VISUAL_TOKENS,
-                :
-            ]
-        )
-
-        # --------------------------------------------------------
-        # NEXT SPATIAL LATENT
-        # --------------------------------------------------------
-
-        predicted_visual_tokens = (
-            self.rgb_latent_head(
-                current_visual_tokens
-            )
-        )
+        rgb_query_outputs = transformed[:, -NUM_VISUAL_TOKENS:, :]
+        predicted_visual_tokens = self.rgb_latent_head(rgb_query_outputs)
 
         rgb_latent = (
             predicted_visual_tokens
@@ -1036,59 +342,24 @@ class WorldModel(nn.Module):
                 SPATIAL_GRID,
                 self.image_latent,
             )
-            .permute(
-                0,
-                3,
-                1,
-                2,
-            )
+            .permute(0, 3, 1, 2)
             .contiguous()
         )
 
-        # --------------------------------------------------------
-        # RGB PREDICTION
-        # --------------------------------------------------------
+        return self.decoder(rgb_latent)
 
-        rgb = self.decoder(
-            rgb_latent
-        )
-
-        return rgb
-
-    # ========================================================
-    # FULL AUTOREGRESSIVE FORWARD
-    # ========================================================
-
-    def forward(
-        self,
-        rgb_history,
-        tcp_history,
-        actions,
-    ):
-
+    def forward(self, rgb_history, tcp_history, actions):
         current_rgb_history = rgb_history
         current_tcp_history = tcp_history
-
         predicted_rgb = []
 
-        for t in range(
-            actions.shape[1]
-        ):
-
+        for t in range(actions.shape[1]):
             rgb = self.predict_one_step(
                 current_rgb_history,
                 current_tcp_history,
                 actions[:, t],
             )
-
-            predicted_rgb.append(
-                rgb
-            )
-
-            # ----------------------------------------------------
-            # RGB FEEDBACK
-            # ----------------------------------------------------
-
+            predicted_rgb.append(rgb)
             current_rgb_history = torch.cat(
                 [
                     current_rgb_history[:, 1:],
@@ -1097,940 +368,414 @@ class WorldModel(nn.Module):
                 dim=1,
             )
 
-        predicted_rgb = torch.stack(
-            predicted_rgb,
-            dim=1,
+        return torch.stack(predicted_rgb, dim=1)
+
+
+# ============================================================
+# CHECKPOINT / METRICS
+# ============================================================
+
+def load_checkpoint(model, checkpoint_path, device):
+    try:
+        checkpoint = torch.load(
+            checkpoint_path,
+            map_location=device,
+            weights_only=False,
+        )
+    except TypeError:
+        checkpoint = torch.load(
+            checkpoint_path,
+            map_location=device,
         )
 
-        return predicted_rgb
-
-
-# ============================================================
-# LOAD MODEL
-# ============================================================
-
-print("\nLoading model...")
-
-model = WorldModel().to(DEVICE)
-
-checkpoint = torch.load(
-    CHECKPOINT,
-    map_location=DEVICE,
-)
-
-model.load_state_dict(
-    checkpoint["model_state_dict"]
-)
-
-model.eval()
-
-print(
-    "Checkpoint epoch:",
-    checkpoint.get(
-        "epoch",
-        "unknown",
-    ),
-)
-
-
-print(
-    "Checkpoint val loss:",
-    checkpoint.get(
-        "val_loss",
-        "unknown",
-    ),
-)
-
-# ============================================================
-# DATA LOADER
-# ============================================================
-
-print("\nCreating evaluation DataLoader...")
-
-dataset = EvaluationDataset(
-    samples,
-    eval_indices,
-    action_mean,
-    action_std,
-    tcp_mean,
-    tcp_std,
-)
-
-
-def worker_init_fn(worker_id):
-
-    import os
-
-    os.environ[
-        "OMP_NUM_THREADS"
-    ] = "1"
-
-    os.environ[
-        "MKL_NUM_THREADS"
-    ] = "1"
-
-
-loader = DataLoader(
-    dataset,
-    batch_size=BATCH_SIZE,
-    shuffle=False,
-    num_workers=NUM_WORKERS,
-    pin_memory=True,
-    persistent_workers=(
-        NUM_WORKERS > 0
-    ),
-    prefetch_factor=2,
-    worker_init_fn=worker_init_fn,
-)
-
-
-print(
-    "Evaluation batches:",
-    len(loader),
-)
-
-print("\nTesting spatial Transformer forward pass...")
-
-test_batch = next(iter(loader))
-
-test_rgb = test_batch["rgb_history"].to(
-    DEVICE,
-    non_blocking=True,
-)
-
-test_tcp = test_batch["tcp_history"].to(
-    DEVICE,
-    non_blocking=True,
-)
-
-test_action = test_batch["actions"][:, 0].to(
-    DEVICE,
-    non_blocking=True,
-)
-
-with torch.no_grad():
-
-    test_pred_rgb = model.predict_one_step(
-        test_rgb,
-        test_tcp,
-        test_action,
+    state_dict = (
+        checkpoint["model_state_dict"]
+        if isinstance(checkpoint, dict) and "model_state_dict" in checkpoint
+        else checkpoint
     )
 
-print(
-    "Test RGB output:",
-    tuple(test_pred_rgb.shape),
-)
+    model.load_state_dict(state_dict, strict=True)
+    return checkpoint
 
-del test_rgb
-del test_tcp
-del test_action
-del test_pred_rgb
-del test_batch
 
-if DEVICE == "cuda":
-    torch.cuda.empty_cache()
+def psnr_from_mse(mse):
+    if mse <= 0:
+        return float("inf")
+    return 10.0 * math.log10(1.0 / mse)
+
 
 # ============================================================
-# EVALUATION
+# PLOTS
 # ============================================================
 
-print("\nRunning evaluation...")
+def save_prediction_figure(pred, target, path):
+    fig, axes = plt.subplots(2, HORIZON, figsize=(20, 4.5))
 
-# ------------------------------------------------------------
-# MODEL METRICS
-# ------------------------------------------------------------
+    for t in range(HORIZON):
+        target_img = np.transpose(target[t], (1, 2, 0))
+        pred_img = np.transpose(pred[t], (1, 2, 0))
 
-# ------------------------------------------------------------
-# RGB METRICS
-# ------------------------------------------------------------
+        axes[0, t].imshow(target_img)
+        axes[0, t].set_title(f"GT t+{t + 1}")
+        axes[0, t].axis("off")
 
-total_rgb_mse = 0.0
-total_rgb_mae = 0.0
-total_ssim = 0.0
+        axes[1, t].imshow(pred_img)
+        axes[1, t].set_title(f"Pred t+{t + 1}")
+        axes[1, t].axis("off")
 
-# ------------------------------------------------------------
-# PER-STEP RGB METRICS
-# ------------------------------------------------------------
+    fig.tight_layout()
+    fig.savefig(path, dpi=160, bbox_inches="tight")
+    plt.close(fig)
 
-rgb_mse_per_step = np.zeros(
-    HORIZON,
-    dtype=np.float64,
-)
 
-rgb_mae_per_step = np.zeros(
-    HORIZON,
-    dtype=np.float64,
-)
+def save_error_plot(mse, mae, path):
+    steps = np.arange(1, HORIZON + 1)
+    plt.figure(figsize=(8, 5))
+    plt.plot(steps, mse, marker="o", label="MSE")
+    plt.plot(steps, mae, marker="s", label="MAE")
+    plt.xlabel("Prediction step")
+    plt.ylabel("Error")
+    plt.title("RGB Error per Prediction Step")
+    plt.xticks(steps)
+    plt.grid(True, alpha=0.3)
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(path, dpi=160, bbox_inches="tight")
+    plt.close()
 
-ssim_per_step = np.zeros(
-    HORIZON,
-    dtype=np.float64,
-)
 
-rgb_loss_per_step = np.zeros(
-    HORIZON,
-    dtype=np.float64,
-)
+def save_ssim_plot(ssim_values, path):
+    steps = np.arange(1, HORIZON + 1)
+    plt.figure(figsize=(8, 5))
+    plt.plot(steps, ssim_values, marker="o")
+    plt.xlabel("Prediction step")
+    plt.ylabel("SSIM")
+    plt.title("SSIM per Prediction Step")
+    plt.xticks(steps)
+    plt.grid(True, alpha=0.3)
+    plt.tight_layout()
+    plt.savefig(path, dpi=160, bbox_inches="tight")
+    plt.close()
 
-psnr_per_step = np.zeros(
-    HORIZON,
-    dtype=np.float64,
-)
-
-# ------------------------------------------------------------
-# VISUALIZATION
-# ------------------------------------------------------------
-
-visual_examples = []
-
-MAX_VISUAL_EXAMPLES = 5
-
-# ------------------------------------------------------------
-# TIMER
-# ------------------------------------------------------------
-
-start_time = time.perf_counter()
 
 # ============================================================
-# RUN EVALUATION
+# CLI
 # ============================================================
 
-with torch.no_grad():
+def parse_args():
+    repo_root = Path(__file__).resolve().parents[1]
+    parser = argparse.ArgumentParser(
+        description="Evaluate the RH20T RGB Query Token world model."
+    )
+    parser.add_argument(
+        "--data-root",
+        type=Path,
+        required=True,
+        help=(
+            "Prepared data root containing multistep_index, "
+            "multistep_training and preprocessed_images."
+        ),
+    )
+    parser.add_argument(
+        "--checkpoint",
+        type=Path,
+        default=repo_root / "checkpoints" / "best.pt",
+    )
+    parser.add_argument(
+        "--output-dir",
+        type=Path,
+        default=repo_root / "results" / "evaluation",
+    )
+    parser.add_argument("--batch-size", type=int, default=16)
+    parser.add_argument("--num-workers", type=int, default=2)
+    parser.add_argument(
+        "--num-samples",
+        type=int,
+        default=None,
+        help="Evaluate only this many randomly selected test samples.",
+    )
+    parser.add_argument("--num-visualizations", type=int, default=5)
+    parser.add_argument("--seed", type=int, default=SEED)
+    return parser.parse_args()
 
-    for batch_idx, batch in enumerate(loader):
 
-        # ----------------------------------------------------
-        # MOVE DATA TO DEVICE
-        # ----------------------------------------------------
+# ============================================================
+# MAIN
+# ============================================================
 
-        rgb_history = batch[
-            "rgb_history"
-        ].to(
-            DEVICE,
-            non_blocking=True,
+def main():
+    args = parse_args()
+    set_seed(args.seed)
+
+    data_root = args.data_root.resolve()
+    checkpoint_path = args.checkpoint.resolve()
+    output_dir = args.output_dir.resolve()
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+
+    print("=" * 70)
+    print("MULTISTEP RGB QUERY TOKEN WORLD MODEL EVALUATION")
+    print("=" * 70)
+    print("Device     :", device)
+    if device == "cuda":
+        print("GPU        :", torch.cuda.get_device_name(0))
+    print("Data root  :", data_root)
+    print("Checkpoint :", checkpoint_path)
+    print("Output     :", output_dir)
+
+    index_path = data_root / "multistep_index" / "samples.npy"
+    train_dir = data_root / "multistep_training"
+    cache_dir = data_root / "preprocessed_images"
+    cache_file = cache_dir / "images.dat"
+    cache_index_file = cache_dir / "index.json"
+    test_indices_path = train_dir / "test_indices.npy"
+
+    required = [
+        index_path,
+        test_indices_path,
+        train_dir / "action_mean.npy",
+        train_dir / "action_std.npy",
+        train_dir / "tcp_mean.npy",
+        train_dir / "tcp_std.npy",
+        cache_file,
+        cache_index_file,
+        checkpoint_path,
+    ]
+    for path in required:
+        if not path.exists():
+            raise FileNotFoundError(f"Required file not found:\n{path}")
+
+    print("\nLoading sample index...")
+    samples = np.load(index_path, allow_pickle=True)
+    print("Total samples:", len(samples))
+
+    test_indices_all = np.load(test_indices_path)
+    print("Total test samples:", len(test_indices_all))
+
+    if args.num_samples is None or len(test_indices_all) <= args.num_samples:
+        eval_indices = np.asarray(test_indices_all, dtype=np.int64)
+    else:
+        rng = np.random.default_rng(args.seed)
+        eval_indices = rng.choice(
+            test_indices_all,
+            size=args.num_samples,
+            replace=False,
+        ).astype(np.int64)
+
+    print("Evaluation samples:", len(eval_indices))
+
+    action_mean = torch.tensor(
+        np.load(train_dir / "action_mean.npy"), dtype=torch.float32
+    )
+    action_std = torch.tensor(
+        np.load(train_dir / "action_std.npy"), dtype=torch.float32
+    )
+    tcp_mean = torch.tensor(
+        np.load(train_dir / "tcp_mean.npy"), dtype=torch.float32
+    )
+    tcp_std = torch.tensor(
+        np.load(train_dir / "tcp_std.npy"), dtype=torch.float32
+    )
+
+    print("\nLoading preprocessed image cache...")
+    image_cache = ImageCache(cache_file, cache_index_file)
+    print("Cached images:", f"{image_cache.num_images:,}")
+
+    dataset = MultistepDataset(
+        samples,
+        eval_indices,
+        action_mean,
+        action_std,
+        tcp_mean,
+        tcp_std,
+        image_cache,
+    )
+
+    loader_kwargs = dict(
+        batch_size=args.batch_size,
+        shuffle=False,
+        num_workers=args.num_workers,
+        pin_memory=(device == "cuda"),
+    )
+    if args.num_workers > 0:
+        loader_kwargs.update(
+            persistent_workers=True,
+            prefetch_factor=2,
         )
 
-        tcp_history = batch[
-            "tcp_history"
-        ].to(
-            DEVICE,
-            non_blocking=True,
-        )
+    loader = DataLoader(dataset, **loader_kwargs)
 
-        actions = batch[
-            "actions"
-        ].to(
-            DEVICE,
-            non_blocking=True,
-        )
+    model = WorldModel().to(device)
+    checkpoint = load_checkpoint(model, checkpoint_path, device)
+    model.eval()
 
-        target_rgb = batch[
-            "target_rgb"
-        ].to(
-            DEVICE,
-            non_blocking=True,
-        )
+    print(
+        "Trainable parameters:",
+        f"{sum(p.numel() for p in model.parameters() if p.requires_grad):,}",
+    )
+    if isinstance(checkpoint, dict):
+        print("Checkpoint epoch:", checkpoint.get("epoch"))
+        print("Checkpoint val loss:", checkpoint.get("val_loss"))
 
-        # ----------------------------------------------------
-        # AUTOREGRESSIVE MODEL ROLLOUT
-        # ----------------------------------------------------
+    mse_sum = np.zeros(HORIZON, dtype=np.float64)
+    mae_sum = np.zeros(HORIZON, dtype=np.float64)
+    ssim_sum = np.zeros(HORIZON, dtype=np.float64)
+    sample_count = 0
+    viz_count = 0
 
-        current_rgb_history = rgb_history.clone()
-        current_tcp_history = tcp_history
+    print("\nRunning autoregressive evaluation...")
 
-        pred_rgb_steps = []
+    with torch.inference_mode():
+        for batch_idx, batch in enumerate(loader):
+            rgb_history = (
+                batch["rgb_history"].to(device, non_blocking=True)
+                .float()
+                .div_(255.0)
+            )
+            tcp_history = batch["tcp_history"].to(
+                device, non_blocking=True
+            )
+            actions = batch["actions"].to(
+                device, non_blocking=True
+            )
+            target_rgb = (
+                batch["target_rgb"].to(device, non_blocking=True)
+                .float()
+                .div_(255.0)
+            )
 
-        for t in range(HORIZON):
+            current_rgb_history = rgb_history.clone()
+            current_tcp_history = tcp_history
+            predicted_steps = []
 
-            if DEVICE == "cuda":
-
-                with torch.amp.autocast(
-                    "cuda",
+            for t in range(HORIZON):
+                with torch.autocast(
+                    device_type="cuda",
                     dtype=torch.float16,
+                    enabled=(device == "cuda"),
                 ):
-
-                    pred_rgb_t = (
-                        model.predict_one_step(
-                            current_rgb_history,
-                            current_tcp_history,
-                            actions[:, t],
-                        )
-                    )
-
-            else:
-
-                pred_rgb_t = (
-                    model.predict_one_step(
+                    pred_rgb_t = model.predict_one_step(
                         current_rgb_history,
                         current_tcp_history,
                         actions[:, t],
                     )
+
+                predicted_steps.append(pred_rgb_t.float())
+                current_rgb_history = torch.cat(
+                    [
+                        current_rgb_history[:, 1:],
+                        pred_rgb_t.float().detach().unsqueeze(1),
+                    ],
+                    dim=1,
                 )
 
-            pred_rgb_steps.append(
-                pred_rgb_t
-            )
+            pred_rgb = torch.stack(predicted_steps, dim=1)
+            batch_size = pred_rgb.shape[0]
 
-            # ------------------------------------------------
-            # Feed predictions into next history
-            # ------------------------------------------------
+            for t in range(HORIZON):
+                pred_t = pred_rgb[:, t]
+                target_t = target_rgb[:, t]
 
-            current_rgb_history = torch.cat(
-                [
-                    current_rgb_history[:, 1:],
-                    pred_rgb_t.unsqueeze(1),
-                ],
-                dim=1,
-            )
-
-        pred_rgb = torch.stack(
-            pred_rgb_steps,
-            dim=1,
-        )
-
-        # --------------------------------------------------------
-        # RGB MSE
-        # --------------------------------------------------------
-
-        rgb_mse = torch.mean(
-            (
-                pred_rgb
-                - target_rgb
-            ) ** 2
-        )
-
-        # --------------------------------------------------------
-        # RGB MAE
-        # --------------------------------------------------------
-
-        rgb_mae = torch.mean(
-            torch.abs(
-                pred_rgb
-                - target_rgb
-            )
-        )
-
-        # --------------------------------------------------------
-        # SSIM
-        # --------------------------------------------------------
-
-        pred_rgb_ssim = (
-            pred_rgb
-            .reshape(
-                -1,
-                3,
-                IMAGE_SIZE,
-                IMAGE_SIZE,
-            )
-            .float()
-        )
-
-        target_rgb_ssim = (
-            target_rgb
-            .reshape(
-                -1,
-                3,
-                IMAGE_SIZE,
-                IMAGE_SIZE,
-            )
-            .float()
-        )
-
-        with torch.autocast(
-            device_type=DEVICE,
-            enabled=False,
-        ):
-
-            ssim_value = ssim(
-                pred_rgb_ssim,
-                target_rgb_ssim,
-                data_range=1.0,
-                size_average=True,
-            )
-
-        total_rgb_mse += rgb_mse.item()
-        total_rgb_mae += rgb_mae.item()
-        total_ssim += ssim_value.item()
-
-        # ----------------------------------------------------
-        # PER-STEP METRICS
-        # ----------------------------------------------------
-
-        for t in range(HORIZON):
-
-            # ----------------------------------------------------
-            # MSE
-            # ----------------------------------------------------
-
-            mse_t = torch.mean(
-                (
-                    pred_rgb[:, t]
-                    - target_rgb[:, t]
-                ) ** 2
-            )
-
-            # ----------------------------------------------------
-            # MAE
-            # ----------------------------------------------------
-
-            mae_t = torch.mean(
-                torch.abs(
-                    pred_rgb[:, t]
-                    - target_rgb[:, t]
-                )
-            )
-
-            # ----------------------------------------------------
-            # SSIM
-            # ----------------------------------------------------
-
-            with torch.autocast(
-                device_type=DEVICE,
-                enabled=False,
-            ):
-
-                ssim_t = ssim(
-                    pred_rgb[:, t].float(),
-                    target_rgb[:, t].float(),
+                mse_batch = (pred_t - target_t).pow(2).mean(dim=(1, 2, 3))
+                mae_batch = (pred_t - target_t).abs().mean(dim=(1, 2, 3))
+                ssim_batch = ssim(
+                    pred_t.float(),
+                    target_t.float(),
                     data_range=1.0,
-                    size_average=True,
+                    size_average=False,
                 )
 
-            rgb_mse_per_step[t] += mse_t.item()
-            rgb_mae_per_step[t] += mae_t.item()
-            ssim_per_step[t] += ssim_t.item()
+                mse_sum[t] += mse_batch.double().sum().item()
+                mae_sum[t] += mae_batch.double().sum().item()
+                ssim_sum[t] += ssim_batch.double().sum().item()
 
-            rgb_loss_per_step[t] += (
-                0.7 * mae_t.item()
-                + 0.3 * (1.0 - ssim_t.item())
-            )
-
-            psnr_per_step[t] += (
-                10.0
-                * np.log10(
-                    1.0 / max(
-                        mse_t.item(),
-                        1e-12,
-                    )
+            while viz_count < args.num_visualizations and viz_count < batch_size:
+                save_prediction_figure(
+                    pred_rgb[viz_count].detach().cpu().numpy(),
+                    target_rgb[viz_count].detach().cpu().numpy(),
+                    output_dir / f"rgb_prediction_{viz_count:02d}.png",
                 )
-            )
-            
-        # ----------------------------------------------------
-        # SAVE VISUALIZATION EXAMPLES
-        # ----------------------------------------------------
+                viz_count += 1
 
-        if len(visual_examples) < MAX_VISUAL_EXAMPLES:
+            sample_count += batch_size
 
-            n = min(
-                MAX_VISUAL_EXAMPLES
-                - len(visual_examples),
+            if (batch_idx + 1) % 50 == 0 or (batch_idx + 1) == len(loader):
+                print(f"  batch {batch_idx + 1}/{len(loader)}")
 
-                rgb_history.shape[0],
-            )
+    if sample_count == 0:
+        raise RuntimeError("No test samples were evaluated.")
 
-            for j in range(n):
-
-                visual_examples.append(
-                    {
-                        "history":
-                            rgb_history[j]
-                            .float()
-                            .cpu(),
-
-                        "target_rgb":
-                            target_rgb[j]
-                            .float()
-                            .cpu(),
-
-                        "pred_rgb":
-                            pred_rgb[j]
-                            .float()
-                            .cpu(),
-                    }
-                )
-
-        # ----------------------------------------------------
-        # PROGRESS
-        # ----------------------------------------------------
-
-        if (
-            (batch_idx + 1) % 10
-            == 0
-        ):
-
-            print(
-                f"  batch "
-                f"{batch_idx + 1}/"
-                f"{len(loader)}"
-            )
-
-        # ----------------------------------------------------
-        # BATCH COUNT
-        # ----------------------------------------------------
-
-        num_batches = (
-            batch_idx + 1
-        )
-
-
-# ============================================================
-# FINAL METRICS
-# ============================================================
-
-if DEVICE == "cuda":
-    torch.cuda.synchronize()
-
-elapsed = (
-    time.perf_counter()
-    - start_time
-)
-
-# ------------------------------------------------------------
-# AVERAGE MODEL LOSSES
-# ------------------------------------------------------------
-total_rgb_mse /= num_batches
-total_rgb_mae /= num_batches
-total_ssim /= num_batches
-
-psnr = 10.0 * np.log10(
-    1.0 / max(total_rgb_mse, 1e-12)
-)
-
-total_rgb_loss = (
-    0.7 * total_rgb_mae
-    + 0.3 * (1.0 - total_ssim)
-)
-
-rgb_mse_per_step /= num_batches
-rgb_mae_per_step /= num_batches
-ssim_per_step /= num_batches
-rgb_loss_per_step /= num_batches
-psnr_per_step /= num_batches
-
-# ============================================================
-# PRINT RESULTS
-# ============================================================
-
-print("\n" + "=" * 70)
-print("RGB EVALUATION RESULTS")
-print("=" * 70)
-
-print(
-    f"Samples evaluated : "
-    f"{len(eval_indices):,}"
-)
-
-print(
-    f"RGB MSE           : "
-    f"{total_rgb_mse:.8f}"
-)
-
-print(
-    f"RGB MAE           : "
-    f"{total_rgb_mae:.8f}"
-)
-
-print(
-    f"SSIM              : "
-    f"{total_ssim:.8f}"
-)
-
-print(
-    f"Evaluation time    : "
-    f"{elapsed:.2f} seconds"
-)
-
-print(
-    f"RGB L1+SSIM loss : "
-    f"{total_rgb_loss:.8f}"
-)
-
-print(
-    f"PSNR              : "
-    f"{psnr:.4f} dB"
-)
-
-
-# ============================================================
-# PER-STEP METRICS
-# ============================================================
-
-print("\nPer-step RGB metrics:")
-
-for t in range(HORIZON):
-
-    print(
-        f"  t+{t + 1:02d} "
-        f"| MSE = {rgb_mse_per_step[t]:.8f} "
-        f"| MAE = {rgb_mae_per_step[t]:.8f} "
-        f"| SSIM = {ssim_per_step[t]:.6f} "
-        f"| Loss = {rgb_loss_per_step[t]:.8f}"
+    per_step_mse = mse_sum / sample_count
+    per_step_mae = mae_sum / sample_count
+    per_step_ssim = ssim_sum / sample_count
+    per_step_psnr = np.array(
+        [psnr_from_mse(x) for x in per_step_mse],
+        dtype=np.float64,
     )
 
-# ============================================================
-# SAVE METRICS
-# ============================================================
-
-metrics = {
-
-    "checkpoint":
-        str(CHECKPOINT),
-
-    "checkpoint_epoch":
-        checkpoint.get(
-            "epoch",
-            None,
-        ),
-
-    "checkpoint_val_loss":
-        checkpoint.get(
-            "val_loss",
-            None,
-        ),
-
-    "num_samples":
-        int(len(eval_indices)),
-
-    "rgb_loss":
-        float(total_rgb_loss),
-
-    "rgb_mse":
-        float(total_rgb_mse),
-
-    "rgb_mae":
-        float(total_rgb_mae),
-
-    "ssim":
-        float(total_ssim),
-
-    "psnr_db":
-        float(psnr),
-
-    "rgb_loss_per_step":
-        rgb_loss_per_step.tolist(),
-
-    "rgb_mse_per_step":
-        rgb_mse_per_step.tolist(),
-
-    "rgb_mae_per_step":
-        rgb_mae_per_step.tolist(),
-
-    "ssim_per_step":
-        ssim_per_step.tolist(),
-
-    "psnr_per_step":
-        psnr_per_step.tolist(),
-
-    "evaluation_time_seconds":
-        float(elapsed),
-
-    "history":
-        HISTORY,
-
-    "horizon":
-        HORIZON,
-
-    "spatial_grid":
-        SPATIAL_GRID,
-
-    "transformer_dim":
-        TRANSFORMER_DIM,
-
-    "transformer_heads":
-        TRANSFORMER_HEADS,
-
-    "transformer_layers":
-        TRANSFORMER_LAYERS,
-
-    "batch_size":
-        BATCH_SIZE,
-
-    "seed":
-        SEED,
-}
-
-with open(
-    OUTPUT_DIR / "metrics.json",
-    "w",
-) as f:
-
-    json.dump(
-        metrics,
-        f,
-        indent=2,
+    rgb_mse = float(per_step_mse.mean())
+    rgb_mae = float(per_step_mae.mean())
+    mean_ssim = float(per_step_ssim.mean())
+    psnr_db = float(psnr_from_mse(rgb_mse))
+    l1_ssim_loss = float(
+        0.7 * rgb_mae + 0.3 * (1.0 - mean_ssim)
     )
 
-# ============================================================
-# RGB VISUALIZATION
-# ============================================================
-
-print("\nSaving RGB prediction visualizations...")
-
-
-for example_id, example in enumerate(
-    visual_examples
-):
-
-    target = (
-        example["target_rgb"]
-        .numpy()
+    save_error_plot(
+        per_step_mse,
+        per_step_mae,
+        output_dir / "rgb_error_per_step.png",
+    )
+    save_ssim_plot(
+        per_step_ssim,
+        output_dir / "ssim_per_step.png",
     )
 
-    prediction = (
-        example["pred_rgb"]
-        .numpy()
-    )
-
-    # Convert uint8 images to [0, 1]
-    if target.max() > 1.0:
-        target = target / 255.0
-
-    if prediction.max() > 1.0:
-        prediction = prediction / 255.0
-
-
-    # --------------------------------------------------------
-    # Figure
-    # --------------------------------------------------------
-
-    fig, axes = plt.subplots(
-        2,
-        HORIZON,
-        figsize=(20, 5),
-    )
-
-
-    # --------------------------------------------------------
-    # Actual
-    # --------------------------------------------------------
-
-    for t in range(HORIZON):
-
-        image = np.transpose(
-            target[t],
-            (1, 2, 0),
-        )
-
-        axes[0, t].imshow(
-            np.clip(
-                image,
-                0,
-                1,
-            )
-        )
-
-        axes[0, t].set_title(
-            f"t+{t + 1}"
-        )
-
-        axes[0, t].axis(
-            "off"
-        )
-
-
-    # --------------------------------------------------------
-    # Predicted
-    # --------------------------------------------------------
-
-    for t in range(HORIZON):
-
-        image = np.transpose(
-            prediction[t],
-            (1, 2, 0),
-        )
-
-        axes[1, t].imshow(
-            np.clip(
-                image,
-                0,
-                1,
-            )
-        )
-
-        axes[1, t].set_title(
-            f"t+{t + 1}"
-        )
-
-        axes[1, t].axis(
-            "off"
-        )
-
-
-    axes[0, 0].set_ylabel(
-        "Actual",
-        fontsize=12,
-    )
-
-    axes[1, 0].set_ylabel(
-        "Predicted",
-        fontsize=12,
-    )
-
-
-    fig.suptitle(
-        f"World Model RGB Prediction "
-        f"— Example {example_id}",
-        fontsize=14,
-    )
-
-
-    plt.tight_layout()
-
-
-    filename = (
-        OUTPUT_DIR
-        / f"rgb_prediction_{example_id:02d}.png"
-    )
-
-
-    plt.savefig(
-        filename,
-        dpi=150,
-        bbox_inches="tight",
-    )
-
-    plt.close()
-
-# ============================================================
-# PER-STEP ERROR PLOT
-# ============================================================
-
-steps = np.arange(
-    1,
-    HORIZON + 1,
-)
-
-plt.figure(
-    figsize=(10, 6)
-)
-
-plt.plot(
-    steps,
-    rgb_mse_per_step,
-    marker="o",
-    label="RGB MSE",
-)
-
-plt.plot(
-    steps,
-    rgb_mae_per_step,
-    marker="s",
-    label="RGB MAE",
-)
-
-plt.xlabel(
-    "Prediction step"
-)
-
-plt.ylabel(
-    "Error"
-)
-
-plt.title(
-    "RGB Prediction Error vs Prediction Horizon"
-)
-
-plt.xticks(
-    steps
-)
-
-plt.legend()
-
-plt.tight_layout()
-
-plt.savefig(
-    OUTPUT_DIR / "rgb_error_per_step.png",
-    dpi=150,
-    bbox_inches="tight",
-)
-
-plt.close()
-
-
-# ============================================================
-# PER-STEP SSIM PLOT
-# ============================================================
-
-plt.figure(
-    figsize=(10, 6)
-)
-
-plt.plot(
-    steps,
-    ssim_per_step,
-    marker="o",
-)
-
-plt.xlabel(
-    "Prediction step"
-)
-
-plt.ylabel(
-    "SSIM"
-)
-
-plt.title(
-    "RGB SSIM vs Prediction Horizon"
-)
-
-plt.xticks(
-    steps
-)
-
-plt.tight_layout()
-
-plt.savefig(
-    OUTPUT_DIR / "ssim_per_step.png",
-    dpi=150,
-    bbox_inches="tight",
-)
-
-plt.close()
-
-# ============================================================
-# DONE
-# ============================================================
-
-print("\n" + "=" * 70)
-print("EVALUATION COMPLETE")
-print("=" * 70)
-
-print(
-    "\nResults saved to:"
-)
-
-print(
-    OUTPUT_DIR
-)
-
-print(
-    "\nFiles:"
-)
-
-print(
-    "  metrics.json"
-)
-
-print(
-    "  rgb_error_per_step.png"
-)
-
-print(
-    "  ssim_per_step.png"
-)
-
-print(
-    "  rgb_prediction_00.png ..."
-)
-
-print(
-    "  ssim_per_step.png"
-)
-
-print(
-    "\nEvaluated checkpoint:"
-)
-
-print(
-    CHECKPOINT
-)
+    checkpoint_metadata = {}
+    if isinstance(checkpoint, dict):
+        for key in ("epoch", "val_loss", "val_rgb", "val_ssim"):
+            if key in checkpoint:
+                checkpoint_metadata[key] = checkpoint[key]
+
+    metrics = {
+        "evaluation_samples": int(sample_count),
+        "history": HISTORY,
+        "horizon": HORIZON,
+        "image_size": IMAGE_SIZE,
+        "spatial_grid": SPATIAL_GRID,
+        "num_visual_tokens": NUM_VISUAL_TOKENS,
+        "rgb_mse": rgb_mse,
+        "rgb_mae": rgb_mae,
+        "ssim": mean_ssim,
+        "psnr_db": psnr_db,
+        "l1_ssim_loss": l1_ssim_loss,
+        "t_plus_1_mse": float(per_step_mse[0]),
+        "t_plus_10_mse": float(per_step_mse[-1]),
+        "per_step_mse": [float(x) for x in per_step_mse],
+        "per_step_mae": [float(x) for x in per_step_mae],
+        "per_step_ssim": [float(x) for x in per_step_ssim],
+        "per_step_psnr_db": [float(x) for x in per_step_psnr],
+        "checkpoint": str(checkpoint_path),
+        "device": device,
+        "seed": args.seed,
+        "checkpoint_metadata": checkpoint_metadata,
+    }
+
+    with (output_dir / "metrics.json").open("w") as f:
+        json.dump(metrics, f, indent=2)
+
+    print("\n" + "=" * 70)
+    print("EVALUATION COMPLETE")
+    print("=" * 70)
+    print(f"RGB MSE : {rgb_mse:.8f}")
+    print(f"RGB MAE : {rgb_mae:.8f}")
+    print(f"SSIM    : {mean_ssim:.8f}")
+    print(f"PSNR    : {psnr_db:.4f} dB")
+    print(f"t+1 MSE : {per_step_mse[0]:.8f}")
+    print(f"t+10 MSE: {per_step_mse[-1]:.8f}")
+    print("\nMetrics saved to:", output_dir / "metrics.json")
+
+
+if __name__ == "__main__":
+    main()

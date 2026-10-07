@@ -21,16 +21,87 @@ if torch.cuda.is_available():
 # CONFIG
 # ============================================================
 
-ROOT = Path("dataset")
+import argparse
 
-INDEX_PATH = ROOT / "multistep_index" / "samples.npy"
-TRAIN_DIR = ROOT / "multistep_training"
-CACHE_DIR = ROOT / "preprocessed_images"
-CACHE_IMAGE_FILE = CACHE_DIR / "images.dat"
-CACHE_INDEX_FILE = CACHE_DIR / "index.json"
+# ============================================================
+# COMMAND-LINE CONFIGURATION
+# ============================================================
 
-OUTPUT_DIR = ROOT / "world_model_transformer_rgb_queries_v3"
-OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+parser = argparse.ArgumentParser(
+    description="Train the RH20T RGB Query Token world model."
+)
+
+parser.add_argument(
+    "--data-root",
+    type=Path,
+    required=True,
+    help="Prepared RH20T data root.",
+)
+
+parser.add_argument(
+    "--output-dir",
+    type=Path,
+    required=True,
+    help="Directory for model checkpoints and training history.",
+)
+
+parser.add_argument(
+    "--batch-size",
+    type=int,
+    default=16,
+)
+
+parser.add_argument(
+    "--epochs",
+    type=int,
+    default=2,
+)
+
+parser.add_argument(
+    "--learning-rate",
+    type=float,
+    default=1e-4,
+)
+
+parser.add_argument(
+    "--num-workers",
+    type=int,
+    default=2,
+)
+
+args = parser.parse_args()
+
+ROOT = args.data_root.resolve()
+
+INDEX_PATH = (
+    ROOT
+    / "multistep_index"
+    / "samples.npy"
+)
+
+TRAIN_DIR = (
+    ROOT
+    / "multistep_training"
+)
+
+CACHE_DIR = (
+    ROOT
+    / "preprocessed_images"
+)
+
+CACHE_IMAGE_FILE = (
+    CACHE_DIR / "images.dat"
+)
+
+CACHE_INDEX_FILE = (
+    CACHE_DIR / "index.json"
+)
+
+OUTPUT_DIR = args.output_dir.resolve()
+OUTPUT_DIR.mkdir(
+    parents=True,
+    exist_ok=True,
+)
 
 HISTORY = 16
 HORIZON = 10
@@ -48,14 +119,13 @@ TRANSFORMER_DROPOUT = 0.1
 SPATIAL_GRID = 4
 NUM_VISUAL_TOKENS = SPATIAL_GRID * SPATIAL_GRID
 
-BATCH_SIZE = 16
-EPOCHS = 2
+BATCH_SIZE = args.batch_size
+EPOCHS = args.epochs
+LR = args.learning_rate
+NUM_WORKERS = args.num_workers
 
 MAX_TRAIN_SAMPLES = None
 MAX_VAL_SAMPLES = None
-LR = 1e-4
-
-NUM_WORKERS = 2
 
 IMAGE_SIZE = 128
 
